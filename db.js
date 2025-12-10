@@ -1,12 +1,18 @@
-import pkg from "pg";
-import dotenv from "dotenv";
+// db.js
+const { Pool } = require("pg");
 
-dotenv.config();
-const { Pool } = pkg;
+if (!process.env.DATABASE_URL) {
+  console.error("Missing DATABASE_URL env variable");
+  process.exit(1);
+}
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: {
+    rejectUnauthorized: false, // required for Supabase / Render
+  },
 });
 
-export default pool;
+module.exports = {
+  query: (text, params) => pool.query(text, params),
+};
