@@ -1,6 +1,6 @@
 // routes/sales.js
 const express = require("express");
-const db = require("../db");
+const db = require("../db"); // expects { pool, query }
 
 const router = express.Router();
 
@@ -22,11 +22,12 @@ router.get("/recent", async (req, res, next) => {
 
     res.json(result.rows);
   } catch (err) {
+    console.error("Error in GET /api/sales/recent:", err);
     next(err);
   }
 });
 
-// POST /api/sales  - create sale, update stock
+// POST /api/sales  - create sale, update stock (transactional)
 router.post("/", async (req, res, next) => {
   const { customerName, items } = req.body;
 
@@ -36,19 +37,16 @@ router.post("/", async (req, res, next) => {
     });
   }
 
-  const client = await db.pool.connect?.() || null;
-
-  // If db.js does not expose pool, we will use pool transaction differently.
-  // To keep it simple for you, we will use a manual BEGIN / COMMIT on the same pool.
+  const client = await db.pool.connect();
 
   try {
-    // Start transaction
-    await db.query("BEGIN");
+    // Start transaction on the acquired client
+    await client.query("BEGIN");
 
     let totalAmount = 0;
 
     // Insert sale header (temporary zero total)
-    const saleResult = await db.query(
+    const saleResult = await client.query(
       `INSERT INTO sales (customer_name, total_amount)
        VALUES ($1, 0)
        RETURNING id`,
@@ -57,14 +55,18 @@ router.post("/", async (req, res, next) => {
 
     const saleId = saleResult.rows[0].id;
 
-    // Handle each item
+    // Handle each item (use same client for SELECT FOR UPDATE + inserts)
     for (const item of items) {
       const productId = item.productId;
-      const quantity = item.quantity;
+      const quantity = Number(item.quantity);
 
-      // Get product info
-      const productResult = await db.query(
-        `SELECT id, selling_price, stock
+      if (!productId || !Number.isFinite(quantity) || quantity <= 0) {
+        throw new Error(`Invalid item data: ${JSON.stringify(item)}`);
+      }
+
+      // Lock the product row for this transaction
+      const productResult = await client.query(
+        `SELECT id, selling_price::numeric AS selling_price, stock
          FROM products
          WHERE id = $1
          FOR UPDATE`,
@@ -76,8 +78,9 @@ router.post("/", async (req, res, next) => {
       }
 
       const product = productResult.rows[0];
+      const currentStock = Number(product.stock);
 
-      if (product.stock < quantity) {
+      if (currentStock < quantity) {
         throw new Error(`Not enough stock for product ${productId}`);
       }
 
@@ -86,14 +89,14 @@ router.post("/", async (req, res, next) => {
       totalAmount += lineTotal;
 
       // Insert sale item
-      await db.query(
+      await client.query(
         `INSERT INTO sale_items (sale_id, product_id, quantity, unit_price)
          VALUES ($1, $2, $3, $4)`,
         [saleId, productId, quantity, unitPrice]
       );
 
       // Decrease stock
-      await db.query(
+      await client.query(
         `UPDATE products
          SET stock = stock - $1
          WHERE id = $2`,
@@ -102,7 +105,7 @@ router.post("/", async (req, res, next) => {
     }
 
     // Update sale total
-    await db.query(
+    await client.query(
       `UPDATE sales
        SET total_amount = $1
        WHERE id = $2`,
@@ -110,7 +113,7 @@ router.post("/", async (req, res, next) => {
     );
 
     // Commit transaction
-    await db.query("COMMIT");
+    await client.query("COMMIT");
 
     res.status(201).json({
       id: saleId,
@@ -120,15 +123,16 @@ router.post("/", async (req, res, next) => {
   } catch (err) {
     // Rollback on error
     try {
-      await db.query("ROLLBACK");
+      await client.query("ROLLBACK");
     } catch (rollbackError) {
       console.error("Rollback failed:", rollbackError);
     }
 
-    console.error("Create sale error:", err.message);
-    res.status(400).json({ message: err.message });
+    console.error("Create sale error:", err);
+    // send a clear error message (without leaking internals)
+    return res.status(400).json({ message: err.message || "Sale creation failed" });
   } finally {
-    if (client) client.release();
+    client.release();
   }
 });
 
