@@ -9,10 +9,14 @@ if (!process.env.DATABASE_URL) {
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: {
-    rejectUnauthorized: false, // required for Supabase / Render
+    rejectUnauthorized: false,
   },
 });
 
+// convenience wrapper
+const query = (text, params) => pool.query(text, params);
+
 module.exports = {
-  query: (text, params) => pool.query(text, params),
+  pool,
+  query,
 };
